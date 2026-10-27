@@ -83,6 +83,12 @@ const stepUnsteppedThreads = (lastSteppedThread) => {
   const threads = vm.runtime.threads;
   const startingIndex = getThreadIndex(lastSteppedThread);
   if (startingIndex !== -1) {
+    if("subtick" in vm.runtime.sequencer) {
+      // TW: tell the sequencer to do only the second half of the tick
+      vm.runtime.sequencer.subtick.init(threads, false);
+      vm.runtime.sequencer.subtick.threadIndex = startingIndex;
+      return;
+    }
     for (let i = startingIndex; i < threads.length; i++) {
       const thread = threads[i];
       const status = thread.status;
