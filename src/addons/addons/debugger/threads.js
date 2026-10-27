@@ -1,4 +1,4 @@
-import { onPauseChanged, isPaused, singleStep, onSingleStep, getRunningThread } from "./module.js";
+import { onPauseChanged, isPaused, singleStep, onSingleStep, getRunningThread, fakeBlockIDtoPreventDespawning } from "./module.js";
 import LogView from "./log-view.js";
 import Highlighter from "../editor-stepping/highlighter.js";
 
@@ -60,6 +60,14 @@ export default async function createThreadsTab({ debug, addon, console, msg }) {
       if (preview) {
         root.appendChild(preview);
       }
+    }
+
+    if(row.type === "thread-stopped") {
+      const el = document.createElement('div');
+      el.className = "sa-debugger-thread-stopped";
+      // TODO: get infrastructure to translate this
+      el.textContent = "(stopped)";
+      root.appendChild(el);
     }
 
     // TW: compiler-related support
@@ -180,12 +188,15 @@ export default async function createThreadsTab({ debug, addon, console, msg }) {
         concatInPlace(result, createBlockInfo(topBlock, 0));
         for (let i = 0; i < thread.stack.length; i++) {
           const blockId = thread.stack[i];
-          if (blockId === topBlock.id) continue;
+          if (blockId === topBlock.id || blockId === fakeBlockIDtoPreventDespawning) continue;
           const block = debug.getBlock(thread.target, blockId);
           if (block) {
             concatInPlace(result, createBlockInfo(block, i));
           }
         }
+      }
+      if(thread.stack[0]===fakeBlockIDtoPreventDespawning) {
+        result.push({type: "thread-stopped", depth});
       }
 
       // TW: compiler-related support

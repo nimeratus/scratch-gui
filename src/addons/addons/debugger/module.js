@@ -22,42 +22,77 @@ let audioContextStateChange = Promise.resolve();
 export const isPaused = () => paused;
 
 const pauseThread = (thread) => {
-  if (thread.updateMonitor || pausedThreadState.has(thread)) {
-    // Thread is already paused or shouldn't be paused.
+  if (thread.updateMonitor) {
+    // Monitor threads shouldn't be paused.
     return;
   }
-
-  const pauseState = {
-    time: vm.runtime.currentMSecs,
-    status: thread.status,
-  };
-  pausedThreadState.set(thread, pauseState);
-
-  // Pausing a thread now works by just setting its status to STATUS_PROMISE_WAIT.
-  // At the start of each frame, we make sure each paused thread is still paused.
-  // This is really the best way to implement this.
-  // Converting thread.status into a getter/setter causes Scratch's sequencer to permanently
-  //    perform significantly slower in some projects. I think this is because it causes some
-  //    very hot functions to be deoptimized.
-  // Trapping sequencer.stepThread to no-op for a paused thread causes Scratch's sequencer
-  //    to waste 24ms of CPU time every frame because it thinks a thread is running.
-  thread.status = STATUS_PROMISE_WAIT;
+  if(!pausedThreadState.has(thread)) {
+    const pauseState = {
+      time: vm.runtime.currentMSecs,
+      status: thread.status,
+      isKilled: thread.isKilled,
+      tempUnpaused: false
+    };
+    pausedThreadState.set(thread, pauseState);
+  }
+  
+  ensurePausedThreadIsStillPaused(thread);
 };
 
+export const fakeBlockIDtoPreventDespawning = Symbol("stopped thread");
+
 const ensurePausedThreadIsStillPaused = (thread) => {
-  if (thread.status === STATUS_DONE) {
-    // If a paused thread is finished by single stepping, let it keep being done.
-    return;
-  }
   const pauseState = pausedThreadState.get(thread);
   if (pauseState) {
+    if(pauseState.tempUnpaused) {
+      // Don't pause, as the thread is being single-stepped and changing the status here can break it.
+      // The single-stepper will re-pause when it's done.
+      return;
+    }
     if (thread.status !== STATUS_PROMISE_WAIT) {
       // We'll record the change so we can properly resume the thread, but the thread must still be paused for now.
       pauseState.status = thread.status;
       thread.status = STATUS_PROMISE_WAIT;
     }
+    if(thread.isKilled) {
+      // prevent from despawning while paused
+      pauseState.isKilled = thread.isKilled;
+      thread.isKilled = false;
+    }
+    if(thread.stack.length === 0) {
+      // prevent from despawning while paused
+      thread.stack.unshift(fakeBlockIDtoPreventDespawning);
+    }
   }
 };
+
+// runs before the thread is single-stepped
+const tempUnpauseThread = (thread) => {
+  const pauseState = pausedThreadState.get(thread);
+  if(!pauseState) return;
+  pauseState.tempUnpaused = true;
+  thread.status = pauseState.status;
+  thread.isKilled = pauseState.isKilled;
+  if(thread.stack[0] === fakeBlockIDtoPreventDespawning) thread.stack.shift();
+}
+// runs after the thread is single-stepped
+// it records the thread's status even if it's a similar to as if the addon paused it
+const repauseThread = (thread) => {
+  const pauseState = pausedThreadState.get(thread);
+  if(!pauseState) {
+    pauseThread(thread);
+    return;
+  }
+  pauseState.tempUnpaused = false;
+  pauseState.status = thread.status;
+  pauseState.isKilled = thread.isKilled;
+  thread.status = STATUS_PROMISE_WAIT;
+  thread.isKilled = false;
+  if(thread.stack.length === 0) {
+    // prevent from despawning while paused
+    thread.stack.unshift(fakeBlockIDtoPreventDespawning);
+  }
+}
 
 const setSteppingThread = (thread) => {
   steppingThread = thread;
@@ -167,11 +202,19 @@ export const getRunningThread = () => steppingThread;
 // https://github.com/scratchfoundation/scratch-vm/blob/0e86a78a00db41af114df64255e2cd7dd881329f/src/engine/sequencer.js#L179
 // Returns if we should continue executing this thread.
 const singleStepThread = (thread) => {
-  if (thread.status === STATUS_DONE) {
+  tempUnpauseThread(thread);
+  try {
+  if (thread.status === STATUS_DONE || thread.status === STATUS_PROMISE_WAIT) {
     return false;
   }
+
+  pauseNewThreads = true;
+  vm.runtime.sequencer.activeThread = thread;
+
   // TW: Can't single-step compiled threads
+  // so multi-step instead
   if (thread.isCompiled) {
+    vm.runtime.sequencer.stepThread(thread);
     return false;
   }
 
@@ -184,9 +227,6 @@ const singleStepThread = (thread) => {
       return false;
     }
   }
-
-  pauseNewThreads = true;
-  vm.runtime.sequencer.activeThread = thread;
 
   /*
     We need to call execute(this, thread) like the original sequencer. We don't
@@ -253,19 +293,17 @@ const singleStepThread = (thread) => {
 
     return true;
   } finally {
-    pauseNewThreads = false;
-    vm.runtime.sequencer.activeThread = null;
     Object.defineProperty(thread, "blockGlowInFrame", {
       value: currentBlockId,
       configurable: true,
       enumerable: true,
       writable: true,
     });
-
-    // Strictly this doesn't seem to be necessary, but let's make sure the thread is still paused after we step it.
-    if (thread.status !== STATUS_DONE) {
-      thread.status = STATUS_PROMISE_WAIT;
-    }
+  }
+  } finally {
+    pauseNewThreads = false;
+    vm.runtime.sequencer.activeThread = null;
+    repauseThread(thread);
   }
 };
 
@@ -276,6 +314,17 @@ const getRealStatus = (thread) => {
   }
   return thread.status;
 };
+
+const isThreadStopped = (thread) => {
+  if(thread.stack.length === 0 || thread.stack[thread.stack.length-1] === fakeBlockIDtoPreventDespawning) {
+    return true;
+  }
+  const pauseState = pausedThreadState.get(thread);
+  if (pauseState) {
+    return pauseState.status === STATUS_DONE || pauseState.isKilled;
+  }
+  return thread.status === STATUS_DONE || thread.isKilled;
+}
 
 const getThreadIndex = (thread) => {
   // We can't use vm.runtime.threads.indexOf(thread) because threads can be restarted.
@@ -301,7 +350,7 @@ const findNewSteppingThread = (startingIndex) => {
     }
     // TW: Can't single-step compiled threads
     if (possibleNewThread.isCompiled) {
-      continue;
+      //continue;
     }
     const status = getRealStatus(possibleNewThread);
     if (status === STATUS_RUNNING || status === STATUS_YIELD || status === STATUS_YIELD_TICK) {
@@ -324,6 +373,9 @@ export const singleStep = () => {
 
     // Execute the block
     const continueExecuting = singleStepThread(steppingThread);
+
+    // Prevent despawning threads
+    vm.runtime.threads.forEach(ensurePausedThreadIsStillPaused);
 
     if (!continueExecuting) {
       // Try to move onto the next thread
@@ -360,6 +412,9 @@ export const singleStep = () => {
         pausedThreadState.get(thread).time += vm.runtime.currentStepTime;
       }
     }
+
+    // Clean up stopped threads
+    vm.runtime.threads = vm.runtime.threads.filter(thread => !isThreadStopped(thread));
 
     // Try to run edge activated hats
     pauseNewThreads = true;
